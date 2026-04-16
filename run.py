@@ -21,7 +21,12 @@ class MultiImageStitcher:
                  ransac_iterations=2000,
                  use_weighted_blend=True,
                  blend_width=50,
-                 use_transparent_bg=True):  # 新增参数
+                 use_transparent_bg=True,
+                 use_cross_check=True,
+                 min_matches=12,
+                 min_inliers=20,
+                 min_inlier_ratio=0.3,
+                 enhance_contrast=True):  # 新增参数
         """
         初始化拼接器
         
@@ -32,6 +37,11 @@ class MultiImageStitcher:
             use_weighted_blend: 是否使用加权融合
             blend_width: 融合区域宽度
             use_transparent_bg: 是否使用透明背景（True=透明，False=黑色）
+            use_cross_check: 是否启用双向匹配一致性过滤
+            min_matches: 最少有效匹配点阈值
+            min_inliers: 最少RANSAC内点阈值
+            min_inlier_ratio: 最少RANSAC内点占比阈值
+            enhance_contrast: 是否在提特征前做对比度增强
         """
         self.ratio = ratio
         self.reproj_thresh = reproj_thresh
@@ -39,6 +49,11 @@ class MultiImageStitcher:
         self.use_weighted_blend = use_weighted_blend
         self.blend_width = blend_width
         self.use_transparent_bg = use_transparent_bg
+        self.use_cross_check = use_cross_check
+        self.min_matches = min_matches
+        self.min_inliers = min_inliers
+        self.min_inlier_ratio = min_inlier_ratio
+        self.enhance_contrast = enhance_contrast
     
     def convert_to_rgba(self, image):
         """将BGR图像转换为BGRA（添加Alpha通道）"""
@@ -53,6 +68,11 @@ class MultiImageStitcher:
             gray = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
         else:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+        # 少帧拼接时，增强局部对比度有助于提升特征稳定性
+        if self.enhance_contrast:
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            gray = clahe.apply(gray)
         
         sift = cv2.SIFT_create()
         keypoints, descriptors = sift.detectAndCompute(gray, None)
@@ -60,21 +80,43 @@ class MultiImageStitcher:
     
     def match_features(self, descriptors1, descriptors2):
         """使用 FLANN 进行特征匹配，并应用 Lowe's Ratio Test 筛选"""
+        if descriptors1 is None or descriptors2 is None:
+            return []
+        if len(descriptors1) < 2 or len(descriptors2) < 2:
+            return []
+
         FLANN_INDEX_KDTREE = 1
         index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
         search_params = dict(checks=50)
         
         flann = cv2.FlannBasedMatcher(index_params, search_params)
-        matches = flann.knnMatch(descriptors1, descriptors2, k=2)
+        matches12 = flann.knnMatch(descriptors1, descriptors2, k=2)
         
-        good_matches = []
-        for match_pair in matches:
+        good12 = []
+        for match_pair in matches12:
             if len(match_pair) >= 2:
                 m, n = match_pair[0], match_pair[1]
                 if m.distance < self.ratio * n.distance:
-                    good_matches.append(m)
+                    good12.append(m)
+
+        if not self.use_cross_check:
+            return sorted(good12, key=lambda x: x.distance)
+
+        matches21 = flann.knnMatch(descriptors2, descriptors1, k=2)
+        good21 = []
+        for match_pair in matches21:
+            if len(match_pair) >= 2:
+                m, n = match_pair[0], match_pair[1]
+                if m.distance < self.ratio * n.distance:
+                    good21.append(m)
+
+        reverse_pairs = {(m.queryIdx, m.trainIdx) for m in good21}
+        cross_checked = [
+            m for m in good12
+            if (m.trainIdx, m.queryIdx) in reverse_pairs
+        ]
         
-        return good_matches
+        return sorted(cross_checked, key=lambda x: x.distance)
     
     def compute_homography(self, keypoints1, keypoints2, good_matches):
         """使用 RANSAC 计算单应性矩阵"""
@@ -169,6 +211,13 @@ class MultiImageStitcher:
         if len(good_matches) < 4:
             print(f"  警告：匹配点不足，跳过此图像")
             return None, {'error': 'insufficient_matches', 'matches': len(good_matches)}
+        if len(good_matches) < self.min_matches:
+            print(f"  警告：有效匹配点低于阈值({self.min_matches})，跳过此图像")
+            return None, {
+                'error': 'insufficient_matches',
+                'matches': len(good_matches),
+                'min_matches': self.min_matches
+            }
         
         # Step 3: 计算单应性矩阵
         start = time.time()
@@ -181,6 +230,20 @@ class MultiImageStitcher:
         if H is None:
             print(f"  警告：无法计算单应性矩阵，跳过此图像")
             return None, {'error': 'homography_failed', 'matches': len(good_matches)}
+
+        inlier_ratio = inliers_count / len(good_matches) if len(good_matches) > 0 else 0.0
+        if inliers_count < self.min_inliers or inlier_ratio < self.min_inlier_ratio:
+            print(f"  警告：几何一致性不足，跳过此图像")
+            print(f"    - 当前内点：{inliers_count}，阈值：{self.min_inliers}")
+            print(f"    - 当前内点率：{inlier_ratio:.2f}，阈值：{self.min_inlier_ratio:.2f}")
+            return None, {
+                'error': 'low_inlier_quality',
+                'matches': len(good_matches),
+                'inliers': inliers_count,
+                'inlier_ratio': inlier_ratio,
+                'min_inliers': self.min_inliers,
+                'min_inlier_ratio': self.min_inlier_ratio
+            }
         
         # Step 4: 图像变换与融合
         start = time.time()
@@ -485,6 +548,14 @@ def extract_frames_from_video(video_path, output_dir, num_frames=10):
     # 获取视频信息
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = int(cap.get(cv2.CAP_PROP_FPS))
+    if total_frames <= 0:
+        print(f"错误：视频帧数异常（{total_frames}）")
+        cap.release()
+        return [], []
+    if fps <= 0:
+        print(f"警告：视频FPS读取异常（{fps}），按 30 fps 估算时间")
+        fps = 30
+
     duration = total_frames / fps
     
     print(f"视频总帧数：{total_frames}")
@@ -502,6 +573,42 @@ def extract_frames_from_video(video_path, output_dir, num_frames=10):
         frame_indices = [total_frames // 2]  # 只抽 1 帧时取中间帧
     else:
         frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
+
+    # 少帧场景：在目标位置附近挑选最清晰帧，降低模糊帧导致的匹配失败概率
+    if num_frames <= 8:
+        refined_indices = []
+        search_radius = max(2, total_frames // max(num_frames * 25, 1))
+        last_idx = -1
+
+        print(f"\n启用清晰度优化抽帧（搜索半径：±{search_radius} 帧）")
+
+        for base_idx in frame_indices:
+            start_idx = max(0, int(base_idx) - search_radius)
+            end_idx = min(total_frames - 1, int(base_idx) + search_radius)
+
+            best_idx = int(base_idx)
+            best_score = -1.0
+
+            for candidate in range(start_idx, end_idx + 1):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, candidate)
+                ok, candidate_frame = cap.read()
+                if not ok or candidate_frame is None:
+                    continue
+
+                gray = cv2.cvtColor(candidate_frame, cv2.COLOR_BGR2GRAY)
+                score = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+                if score > best_score:
+                    best_score = score
+                    best_idx = candidate
+
+            if best_idx <= last_idx:
+                best_idx = min(last_idx + 1, total_frames - 1)
+
+            refined_indices.append(best_idx)
+            last_idx = best_idx
+
+        frame_indices = np.array(refined_indices, dtype=int)
     
     print(f"\n抽取的帧序号：{frame_indices}")
     print(f"对应时间点：{[f'{i/fps:.2f}s' for i in frame_indices]}")
@@ -568,12 +675,17 @@ def stitch_frames(frame_paths, output_dir, use_transparent_bg=True):
     
     # 创建拼接器（启用透明背景）
     stitcher = MultiImageStitcher(
-        ratio=0.75,              # Lowe's Ratio Test 阈值
-        reproj_thresh=3.0,       # RANSAC 重投影阈值
-        ransac_iterations=2000,  # RANSAC 迭代次数
+        ratio=0.70,              # Lowe's Ratio Test 阈值（更严格）
+        reproj_thresh=2.5,       # RANSAC 重投影阈值（更严格）
+        ransac_iterations=5000,  # RANSAC 迭代次数（更稳）
         use_weighted_blend=True, # 启用加权融合
         blend_width=50,          # 融合区域宽度
-        use_transparent_bg=use_transparent_bg  # 使用透明背景
+        use_transparent_bg=use_transparent_bg, # 使用透明背景
+        use_cross_check=True,    # 双向匹配一致性过滤
+        min_matches=12,          # 最少匹配点阈值
+        min_inliers=20,          # 最少内点阈值
+        min_inlier_ratio=0.30,   # 最少内点率阈值
+        enhance_contrast=True    # 提特征前增强局部对比度
     )
     
     # 执行拼接
@@ -697,7 +809,7 @@ def main():
     # ========== 配置区域（可修改） ==========
     
     # 抽取的帧数（可修改）
-    NUM_FRAMES = 4  # <-- 修改这里来改变抽取的帧数
+    NUM_FRAMES =30  # <-- 修改这里来改变抽取的帧数
     
     # 是否使用透明背景（True=透明背景，False=黑色背景）
     USE_TRANSPARENT_BG = True  # <-- 修改这里来控制背景是否透明
@@ -733,10 +845,10 @@ def main():
     if panorama is not None:
         print(f"\n✓ 全景图已成功保存:")
         if USE_TRANSPARENT_BG:
-            print(f"  - 透明背景版：{os.path.join(panorama_output_dir, 'video_panorama.png')}")
-            print(f"  - 透明背景裁剪版：{os.path.join(panorama_output_dir, 'video_panorama_cropped.png')}")
-            print(f"  - JPG预览版（黑色背景）：{os.path.join(panorama_output_dir, 'video_panorama_preview.jpg')}")
-            print(f"  - JPG预览裁剪版：{os.path.join(panorama_output_dir, 'video_panorama_cropped_preview.jpg')}")
+            print(f"  - 透明背景版：{os.path.join(panorama_output_dir, 'video_panorama4.png')}")
+            print(f"  - 透明背景裁剪版：{os.path.join(panorama_output_dir, 'video_panorama_cropped4.png')}")
+            print(f"  - JPG预览版（黑色背景）：{os.path.join(panorama_output_dir, 'video_panorama_preview4.jpg')}")
+            print(f"  - JPG预览裁剪版：{os.path.join(panorama_output_dir, 'video_panorama_cropped_preview4.jpg')}")
         else:
             print(f"  - 完整版：{os.path.join(panorama_output_dir, 'video_panorama.jpg')}")
             print(f"  - 裁剪版：{os.path.join(panorama_output_dir, 'video_panorama_cropped.jpg')}")
